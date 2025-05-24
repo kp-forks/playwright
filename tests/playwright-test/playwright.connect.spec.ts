@@ -215,16 +215,16 @@ test('should record trace', async ({ runInlineTest }) => {
   const trace = await parseTrace(test.info().outputPath('test-results', 'a-fail', 'trace.zip'));
   expect(trace.titles).toEqual([
     'Before Hooks',
-    'fixture: context',
-    'browser.newContext',
-    'fixture: page',
-    'browserContext.newPage',
-    'expect.toBe',
+    'Fixture "context"',
+    'Create context',
+    'Fixture "page"',
+    'Create page',
+    'Expect "toBe"',
     'After Hooks',
-    'fixture: page',
-    'fixture: context',
+    'Fixture "page"',
+    'Fixture "context"',
     'Attach "error-context-0"',
     'Worker Cleanup',
-    'fixture: browser',
+    'Fixture "browser"',
   ]);
 });

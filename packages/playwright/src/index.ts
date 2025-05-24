@@ -18,16 +18,17 @@ import fs from 'fs';
 import path from 'path';
 
 import * as playwrightLibrary from 'playwright-core';
-import { setBoxedStackPrefixes, createGuid, currentZone, debugMode, isString, jsonStringifyForceASCII, asLocator, asLocatorDescription } from 'playwright-core/lib/utils';
+import { setBoxedStackPrefixes, createGuid, currentZone, debugMode, jsonStringifyForceASCII, asLocatorDescription, renderTitleForCall } from 'playwright-core/lib/utils';
 
 import { currentTestInfo } from './common/globals';
 import { rootTestType } from './common/testType';
 import { attachErrorContext } from './errorContext';
+import { stepTitle } from './util';
 
 import type { Fixtures, PlaywrightTestArgs, PlaywrightTestOptions, PlaywrightWorkerArgs, PlaywrightWorkerOptions, ScreenshotMode, TestInfo, TestType, VideoMode } from '../types/test';
 import type { ContextReuseMode } from './common/config';
 import type { TestInfoImpl, TestStepInternal } from './worker/testInfo';
-import type { ApiCallData, ClientInstrumentation, ClientInstrumentationListener } from '../../playwright-core/src/client/clientInstrumentation';
+import type { ClientInstrumentation, ClientInstrumentationListener } from '../../playwright-core/src/client/clientInstrumentation';
 import type { Playwright as PlaywrightImpl } from '../../playwright-core/src/client/playwright';
 import type { APIRequestContext, Browser, BrowserContext, BrowserContextOptions, LaunchOptions, Page, Tracing, Video } from 'playwright-core';
 
@@ -115,7 +116,7 @@ const playwrightFixtures: Fixtures<TestFixtures, WorkerFixtures> = ({
       await use(browser);
       await (browser as any)._wrapApiCall(async () => {
         await browser.close({ reason: 'Test ended.' });
-      }, true);
+      }, { internal: true });
       return;
     }
 
@@ -123,7 +124,7 @@ const playwrightFixtures: Fixtures<TestFixtures, WorkerFixtures> = ({
     await use(browser);
     await (browser as any)._wrapApiCall(async () => {
       await browser.close({ reason: 'Test ended.' });
-    }, true);
+    }, { internal: true });
   }, { scope: 'worker', timeout: 0 }],
 
   acceptDownloads: [({ contextOptions }, use) => use(contextOptions.acceptDownloads ?? true), { option: true }],
@@ -258,7 +259,7 @@ const playwrightFixtures: Fixtures<TestFixtures, WorkerFixtures> = ({
 
     const tracingGroupSteps: TestStepInternal[] = [];
     const csiListener: ClientInstrumentationListener = {
-      onApiCallBegin: (data: ApiCallData) => {
+      onApiCallBegin: (data, channel) => {
         const testInfo = currentTestInfo();
         // Some special calls do not get into steps.
         if (!testInfo || data.apiName.includes('setTestIdAttribute') || data.apiName === 'tracing.groupEnd')
@@ -267,24 +268,28 @@ const playwrightFixtures: Fixtures<TestFixtures, WorkerFixtures> = ({
         if (zone && zone.category === 'expect') {
           // Display the internal locator._expect call under the name of the enclosing expect call,
           // and connect it to the existing expect step.
-          data.apiName = zone.title;
+          if (zone.apiName)
+            data.apiName = zone.apiName;
+          if (zone.title)
+            data.title = stepTitle(zone.category, zone.title);
           data.stepId = zone.stepId;
           return;
         }
+
         // In the general case, create a step for each api call and connect them through the stepId.
         const step = testInfo._addStep({
           location: data.frames[0],
           category: 'pw:api',
-          title: renderApiCall(data.apiName, data.params),
+          title: renderTitle(channel.type, channel.method, channel.params, data.title),
           apiName: data.apiName,
-          params: data.params,
+          params: channel.params,
         }, tracingGroupSteps[tracingGroupSteps.length - 1]);
         data.userData = step;
         data.stepId = step.stepId;
         if (data.apiName === 'tracing.group')
           tracingGroupSteps.push(step);
       },
-      onApiCallEnd: (data: ApiCallData) => {
+      onApiCallEnd: data => {
         // "tracing.group" step will end later, when "tracing.groupEnd" finishes.
         if (data.apiName === 'tracing.group')
           return;
@@ -357,11 +362,11 @@ const playwrightFixtures: Fixtures<TestFixtures, WorkerFixtures> = ({
         await (context as any)._wrapApiCall(async () => {
           await context.clock.install({ time: 0 });
           await context.clock.pauseAt(1000);
-        }, true);
+        }, { internal: true });
       } else if (process.env.PW_CLOCK === 'realtime') {
         await (context as any)._wrapApiCall(async () => {
           await context.clock.install({ time: 0 });
-        }, true);
+        }, { internal: true });
       }
 
       return context;
@@ -372,7 +377,7 @@ const playwrightFixtures: Fixtures<TestFixtures, WorkerFixtures> = ({
     await Promise.all([...contexts.keys()].map(async context => {
       await (context as any)._wrapApiCall(async () => {
         await context.close({ reason: closeReason });
-      }, true);
+      }, { internal: true });
       const testFailed = testInfo.status !== testInfo.expectedStatus;
       const preserveVideo = captureVideo && (videoMode === 'on' || (testFailed && videoMode === 'retain-on-failure') || (videoMode === 'on-first-retry' && testInfo.retry === 1));
       if (preserveVideo) {
@@ -753,47 +758,12 @@ class ArtifactsRecorder {
   }
 }
 
-function paramsToRender(apiName: string) {
-  switch (apiName) {
-    case 'locator.fill':
-      return ['value'];
-    default:
-      return ['url', 'selector', 'text', 'key'];
-  }
-}
-
-function renderApiCall(apiName: string, params: any) {
-  if (apiName === 'tracing.group')
-    return params.name;
-  const paramsArray = [];
-  if (params) {
-    for (const name of paramsToRender(apiName)) {
-      if (!(name in params))
-        continue;
-      if (name === 'selector' && isString(params[name])) {
-        const description = asLocatorDescription(params[name]);
-        if (description) {
-          const replacement = JSON.stringify(description);
-          apiName = apiName.replace(/^locator\.(.*)/, `$1 ${replacement}`);
-          apiName = apiName.replace(/^page\.(.*)/, `$1 ${replacement}`);
-          apiName = apiName.replace(/^frame\.(.*)/, `$1 ${replacement}`);
-        } else if (params[name].startsWith('internal:')) {
-          const replacement = asLocator('javascript', params[name]) + '.';
-          apiName = apiName.replace(/^locator\./, replacement);
-          apiName = apiName.replace(/^page\./, replacement);
-          apiName = apiName.replace(/^frame\./, replacement);
-        } else {
-          const value = params[name];
-          paramsArray.push(value);
-        }
-      } else {
-        const value = params[name];
-        paramsArray.push(value);
-      }
-    }
-  }
-  const paramsText = paramsArray.length ? '(' + paramsArray.join(', ') + ')' : '';
-  return apiName + paramsText;
+function renderTitle(type: string, method: string, params: Record<string, string> | undefined, title?: string) {
+  const prefix = renderTitleForCall({ title, type, method, params });
+  let selector;
+  if (params?.['selector'] && typeof params.selector === 'string')
+    selector = asLocatorDescription('javascript', params.selector);
+  return prefix + (selector ? ` ${selector}` : '');
 }
 
 function tracing() {

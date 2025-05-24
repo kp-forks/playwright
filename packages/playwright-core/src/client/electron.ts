@@ -60,7 +60,8 @@ export class Electron extends ChannelOwner<channels.ElectronChannel> implements 
       timeout: new TimeoutSettings(this._platform).launchTimeout(options),
     };
     const app = ElectronApplication.from((await this._channel.launch(params)).electronApplication);
-    app._context._setOptions(params, options);
+    await app._context._initializeHarFromOptions(options.recordHar);
+    app._context.tracing._tracesDir = options.tracesDir;
     return app;
   }
 }
