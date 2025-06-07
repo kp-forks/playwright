@@ -26,8 +26,7 @@ import * as dom from '../dom';
 import * as frames from '../frames';
 import { helper } from '../helper';
 import * as network from '../network';
-import { kPlaywrightBinding } from '../javascript';
-import { Page, Worker } from '../page';
+import { Page, PageBinding, Worker } from '../page';
 import { registry } from '../registry';
 import { getAccessibilityTree } from './crAccessibility';
 import { CRBrowserContext } from './crBrowser';
@@ -241,8 +240,8 @@ export class CRPage implements PageDelegate {
     await this._forAllFrameSessions(frame => frame.exposePlaywrightBinding());
   }
 
-  async removeNonInternalInitScripts() {
-    await this._forAllFrameSessions(frame => frame._removeEvaluatesOnNewDocument());
+  async removeInitScripts(initScripts: InitScript[]): Promise<void> {
+    await this._forAllFrameSessions(frame => frame._removeEvaluatesOnNewDocument(initScripts));
   }
 
   async closePage(runBeforeUnload: boolean): Promise<void> {
@@ -393,9 +392,9 @@ class FrameSession {
   private _videoRecorder: VideoRecorder | null = null;
   private _screencastId: string | null = null;
   private _screencastClients = new Set<any>();
-  private _evaluateOnNewDocumentIdentifiers: string[] = [];
   private _metricsOverride: Protocol.Emulation.setDeviceMetricsOverrideParameters | undefined;
   private _workerSessions = new Map<string, CRSession>();
+  private _initScriptIds = new Map<InitScript, string>();
 
   constructor(crPage: CRPage, client: CRSession, targetId: string, parentSession: FrameSession | null) {
     this._client = client;
@@ -819,7 +818,7 @@ class FrameSession {
   _onDialog(event: Protocol.Page.javascriptDialogOpeningPayload) {
     if (!this._page.frameManager.frame(this._targetId))
       return; // Our frame/subtree may be gone already.
-    this._page.emitOnContext(BrowserContext.Events.Dialog, new dialog.Dialog(
+    this._page.browserContext.dialogManager.dialogDidOpen(new dialog.Dialog(
         this._page,
         event.type,
         event.message,
@@ -975,9 +974,7 @@ class FrameSession {
     };
     if (JSON.stringify(this._metricsOverride) === JSON.stringify(metricsOverride))
       return;
-    const promises = [
-      this._client.send('Emulation.setDeviceMetricsOverride', metricsOverride),
-    ];
+    const promises = [];
     if (!preserveWindowBoundaries && this._windowId) {
       let insets = { width: 0, height: 0 };
       if (this._crPage._browserContext._browser.options.headful) {
@@ -1001,6 +998,8 @@ class FrameSession {
         height: viewportSize.height + insets.height
       }));
     }
+    // Make sure that the viewport emulationis set after the embedder window resize.
+    promises.push(this._client.send('Emulation.setDeviceMetricsOverride', metricsOverride));
     await Promise.all(promises);
     this._metricsOverride = metricsOverride;
   }
@@ -1060,18 +1059,22 @@ class FrameSession {
   async _evaluateOnNewDocument(initScript: InitScript, world: types.World, runImmediately?: boolean): Promise<void> {
     const worldName = world === 'utility' ? this._crPage.utilityWorldName : undefined;
     const { identifier } = await this._client.send('Page.addScriptToEvaluateOnNewDocument', { source: initScript.source, worldName, runImmediately });
-    if (!initScript.internal)
-      this._evaluateOnNewDocumentIdentifiers.push(identifier);
+    this._initScriptIds.set(initScript, identifier);
   }
 
-  async _removeEvaluatesOnNewDocument(): Promise<void> {
-    const identifiers = this._evaluateOnNewDocumentIdentifiers;
-    this._evaluateOnNewDocumentIdentifiers = [];
-    await Promise.all(identifiers.map(identifier => this._client.send('Page.removeScriptToEvaluateOnNewDocument', { identifier })));
+  async _removeEvaluatesOnNewDocument(initScripts: InitScript[]): Promise<void> {
+    const ids: string[] = [];
+    for (const script of initScripts) {
+      const id = this._initScriptIds.get(script);
+      if (id)
+        ids.push(id);
+      this._initScriptIds.delete(script);
+    }
+    await Promise.all(ids.map(identifier => this._client.send('Page.removeScriptToEvaluateOnNewDocument', { identifier }).catch(() => {}))); // target can be closed
   }
 
   async exposePlaywrightBinding() {
-    await this._client.send('Runtime.addBinding', { name: kPlaywrightBinding });
+    await this._client.send('Runtime.addBinding', { name: PageBinding.kBindingName });
   }
 
   async _getContentFrame(handle: dom.ElementHandle): Promise<frames.Frame | null> {
@@ -1213,7 +1216,7 @@ function calculateUserAgentMetadata(options: types.BrowserContextOptions) {
   const metadata: Protocol.Emulation.UserAgentMetadata = {
     mobile: !!options.isMobile,
     model: '',
-    architecture: 'x64',
+    architecture: 'x86',
     platform: 'Windows',
     platformVersion: '',
   };

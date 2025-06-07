@@ -24,6 +24,7 @@ import { TargetClosedError, isTargetClosedError, serializeError } from '../error
 import { SdkObject } from '../instrumentation';
 import { isProtocolError } from '../protocolError';
 import { compressCallLog } from '../callLog';
+import { methodMetainfo } from '../../utils/isomorphic/protocolMetainfo';
 
 import type { CallMetadata } from '../instrumentation';
 import type { PlaywrightDispatcher } from './playwrightDispatcher';
@@ -59,7 +60,7 @@ export class Dispatcher<Type extends { guid: string }, ChannelType, ParentScopeT
   _object: Type;
   private _openScope = new LongStandingScope();
 
-  constructor(parent: ParentScopeType | DispatcherConnection, object: Type, type: string, initializer: channels.InitializerTraits<Type>, gcBucket?: string) {
+  constructor(parent: ParentScopeType | DispatcherConnection, object: Type, type: string, initializer: channels.InitializerTraits<ChannelType>, gcBucket?: string) {
     super();
 
     this.connection = parent instanceof DispatcherConnection ? parent : parent.connection;
@@ -304,11 +305,17 @@ export class DispatcherConnection {
       return;
     }
 
+    if (methodMetainfo.get(dispatcher._type + '.' + method)?.internal) {
+      // For non-js ports, it is easier to detect internal calls here rather
+      // than generate protocol metainfo for each language.
+      validMetadata.internal = true;
+    }
+
     const sdkObject = dispatcher._object instanceof SdkObject ? dispatcher._object : undefined;
     const callMetadata: CallMetadata = {
       id: `call@${id}`,
       location: validMetadata.location,
-      apiName: validMetadata.apiName,
+      title: validMetadata.title,
       internal: validMetadata.internal,
       stepId: validMetadata.stepId,
       objectId: sdkObject?.guid,

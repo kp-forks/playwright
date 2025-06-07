@@ -30,7 +30,6 @@ import { fetchData } from '../utils/network';
 import { getUserAgent } from '../utils/userAgent';
 import { validateBrowserContextOptions } from '../browserContext';
 import { BrowserType, kNoXServerRunningError } from '../browserType';
-import { BrowserReadyState } from '../browserType';
 import { helper } from '../helper';
 import { registry } from '../registry';
 import { WebSocketTransport } from '../transport';
@@ -126,13 +125,23 @@ export class Chromium extends BrowserType {
     return directory ? new CRDevTools(path.join(directory, 'devtools-preferences.json')) : undefined;
   }
 
-  override async connectToTransport(transport: ConnectionTransport, options: BrowserOptions): Promise<CRBrowser> {
+  override async connectToTransport(transport: ConnectionTransport, options: BrowserOptions, browserLogsCollector: RecentLogsCollector): Promise<CRBrowser> {
     let devtools = this._devtools;
     if ((options as any).__testHookForDevTools) {
       devtools = this._createDevTools();
       await (options as any).__testHookForDevTools(devtools);
     }
-    return CRBrowser.connect(this.attribution.playwright, transport, options, devtools);
+    try {
+      return await CRBrowser.connect(this.attribution.playwright, transport, options, devtools);
+    } catch (e) {
+      if (browserLogsCollector.recentLogs().some(log => log.includes('Failed to create a ProcessSingleton for your profile directory.'))) {
+        throw new Error(
+            'Failed to create a ProcessSingleton for your profile directory. ' +
+            'This usually means that the profile is already in use by another instance of Chromium.'
+        );
+      }
+      throw e;
+    }
   }
 
   override doRewriteStartupLog(error: ProtocolError): ProtocolError {
@@ -295,7 +304,7 @@ export class Chromium extends BrowserType {
       throw new Error('Playwright manages remote debugging connection itself.');
     if (args.find(arg => !arg.startsWith('-')))
       throw new Error('Arguments can not specify page to be opened');
-    const chromeArguments = [...chromiumSwitches(options.assistantMode)];
+    const chromeArguments = [...chromiumSwitches(options.assistantMode, options.channel)];
 
     if (os.platform() === 'darwin') {
       // See https://github.com/microsoft/playwright/issues/7362
@@ -343,10 +352,8 @@ export class Chromium extends BrowserType {
     return chromeArguments;
   }
 
-  override readyState(options: types.LaunchOptions): BrowserReadyState | undefined {
-    if (options.cdpPort !== undefined || options.args?.some(a => a.startsWith('--remote-debugging-port')))
-      return new ChromiumReadyState();
-    return undefined;
+  override async waitForReadyState(options: types.LaunchOptions, browserLogsCollector: RecentLogsCollector): Promise<{ wsEndpoint?: string }> {
+    return waitForReadyState(options, browserLogsCollector);
   }
 
   override getExecutableName(options: types.LaunchOptions): string {
@@ -356,19 +363,31 @@ export class Chromium extends BrowserType {
   }
 }
 
-class ChromiumReadyState extends BrowserReadyState {
-  override onBrowserOutput(message: string): void {
+export async function waitForReadyState(options: types.LaunchOptions, browserLogsCollector: RecentLogsCollector): Promise<{ wsEndpoint?: string }> {
+  if (options.cdpPort === undefined && !options.args?.some(a => a.startsWith('--remote-debugging-port')))
+    return {};
+
+  const result = new ManualPromise<{ wsEndpoint?: string }>();
+  browserLogsCollector.onMessage(message => {
+    if (message.includes('Failed to create a ProcessSingleton for your profile directory.')) {
+      result.reject(new Error('Failed to create a ProcessSingleton for your profile directory. ' +
+        'This usually means that the profile is already in use by another instance of Chromium.'));
+    }
     const match = message.match(/DevTools listening on (.*)/);
     if (match)
-      this._wsEndpoint.resolve(match[1]);
-  }
+      result.resolve({ wsEndpoint: match[1] });
+  });
+  return result;
 }
 
 async function urlToWSEndpoint(progress: Progress, endpointURL: string, headers: { [key: string]: string; }) {
   if (endpointURL.startsWith('ws'))
     return endpointURL;
   progress.log(`<ws preparing> retrieving websocket url from ${endpointURL}`);
-  const httpURL = endpointURL.endsWith('/') ? `${endpointURL}json/version/` : `${endpointURL}/json/version/`;
+  const url = new URL(endpointURL);
+  url.pathname += 'json/version/';
+  const httpURL = url.toString();
+
   const json = await fetchData({
     url: httpURL,
     headers,

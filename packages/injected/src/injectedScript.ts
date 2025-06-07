@@ -32,7 +32,7 @@ import { elementMatchesText, elementText, getElementLabels } from './selectorUti
 import { createVueEngine } from './vueSelectorEngine';
 import { XPathEngine } from './xpathSelectorEngine';
 import { ConsoleAPI } from './consoleApi';
-import { ensureUtilityScript } from './utilityScript';
+import { UtilityScript } from './utilityScript';
 
 import type { AriaTemplateNode } from '@isomorphic/ariaSnapshot';
 import type { CSSComplexSelectorList } from '@isomorphic/cssParser';
@@ -53,8 +53,9 @@ export type ElementState = 'visible' | 'hidden' | 'enabled' | 'disabled' | 'edit
 export type ElementStateWithoutStable = Exclude<ElementState, 'stable'>;
 export type ElementStateQueryResult = { matches: boolean, received?: string | 'error:notconnected' };
 
+export type HitTargetError = { hitTargetDescription: string, hasPositionStickyOrFixed: boolean };
 export type HitTargetInterceptionResult = {
-  stop: () => 'done' | { hitTargetDescription: string };
+  stop: () => 'done' | HitTargetError;
 };
 
 interface WebKitLegacyDeviceOrientationEvent extends DeviceOrientationEvent {
@@ -66,7 +67,7 @@ interface WebKitLegacyDeviceMotionEvent extends DeviceMotionEvent {
 }
 
 export type InjectedScriptOptions = {
-  isUnderTest?: boolean;
+  isUnderTest: boolean;
   sdkLanguage: Language;
   // For strict error and codegen
   testIdAttributeName: string;
@@ -108,6 +109,7 @@ export class InjectedScript {
     isInsideScope,
     normalizeWhiteSpace,
     parseAriaSnapshot,
+    // Builtins protect injected code from clock emulation.
     builtins: null as unknown as Builtins,
   };
 
@@ -123,11 +125,10 @@ export class InjectedScript {
   constructor(window: Window & typeof globalThis, options: InjectedScriptOptions) {
     this.window = window;
     this.document = window.document;
+    this.isUnderTest = options.isUnderTest;
     // Make sure builtins are created from "window". This is important for InjectedScript instantiated
     // inside a trace viewer snapshot, where "window" differs from "globalThis".
-    const utilityScript = ensureUtilityScript(window);
-    this.isUnderTest = options.isUnderTest ?? utilityScript.isUnderTest;
-    this.utils.builtins = utilityScript.builtins;
+    this.utils.builtins = new UtilityScript(window, options.isUnderTest).builtins;
     this._sdkLanguage = options.sdkLanguage;
     this._testIdAttributeNameForStrictErrorAndConsoleCodegen = options.testIdAttributeName;
     this._evaluator = new SelectorEvaluatorImpl();
@@ -564,7 +565,7 @@ export class InjectedScript {
       observer.observe(element);
       // Firefox doesn't call IntersectionObserver callback unless
       // there are rafs.
-      requestAnimationFrame(() => {});
+      this.utils.builtins.requestAnimationFrame(() => {});
     });
   }
 
@@ -645,7 +646,7 @@ export class InjectedScript {
         return 'error:notconnected';
 
       // Drop frames that are shorter than 16ms - WebKit Win bug.
-      const time = performance.now();
+      const time = this.utils.builtins.performance.now();
       if (this._stableRafCount > 1 && time - lastTime < 15)
         return continuePolling;
       lastTime = time;
@@ -673,12 +674,12 @@ export class InjectedScript {
         if (success !== continuePolling)
           fulfill(success);
         else
-          requestAnimationFrame(raf);
+          this.utils.builtins.requestAnimationFrame(raf);
       } catch (e) {
         reject(e);
       }
     };
-    requestAnimationFrame(raf);
+    this.utils.builtins.requestAnimationFrame(raf);
 
     return result;
   }
@@ -923,7 +924,7 @@ export class InjectedScript {
     input.dispatchEvent(new Event('change', { bubbles: true }));
   }
 
-  expectHitTarget(hitPoint: { x: number, y: number }, targetElement: Element) {
+  expectHitTarget(hitPoint: { x: number, y: number }, targetElement: Element): 'done' | HitTargetError {
     const roots: (Document | ShadowRoot)[] = [];
 
     // Get all component roots leading to the target element.
@@ -976,14 +977,21 @@ export class InjectedScript {
 
     // Check whether hit target is the target or its descendant.
     const hitParents: Element[] = [];
+    const isHitParentPositionStickyOrFixed: boolean[] = [];
     while (hitElement && hitElement !== targetElement) {
       hitParents.push(hitElement);
+      isHitParentPositionStickyOrFixed.push(['sticky', 'fixed'].includes(this.window.getComputedStyle(hitElement).position));
       hitElement = parentElementOrShadowHost(hitElement);
     }
     if (hitElement === targetElement)
       return 'done';
 
+    // The description of the element that was hit instead of the target element.
     const hitTargetDescription = this.previewNode(hitParents[0] || this.document.documentElement);
+    // Whether any ancestor of the hit target has position: static. In this case, it could be
+    // beneficial to scroll the target element into different positions to reveal it.
+    let hasPositionStickyOrFixed = isHitParentPositionStickyOrFixed.some(x => x);
+
     // Root is the topmost element in the hitTarget's chain that is not in the
     // element's chain. For example, it might be a dialog element that overlays
     // the target.
@@ -994,13 +1002,14 @@ export class InjectedScript {
       if (index !== -1) {
         if (index > 1)
           rootHitTargetDescription = this.previewNode(hitParents[index - 1]);
+        hasPositionStickyOrFixed = isHitParentPositionStickyOrFixed.slice(0, index).some(x => x);
         break;
       }
       element = parentElementOrShadowHost(element);
     }
     if (rootHitTargetDescription)
-      return { hitTargetDescription: `${hitTargetDescription} from ${rootHitTargetDescription} subtree` };
-    return { hitTargetDescription };
+      return { hitTargetDescription: `${hitTargetDescription} from ${rootHitTargetDescription} subtree`, hasPositionStickyOrFixed };
+    return { hitTargetDescription, hasPositionStickyOrFixed };
   }
 
   // Life of a pointer action, for example click.
@@ -1033,7 +1042,7 @@ export class InjectedScript {
   //     2k. (injected) Event interceptor is removed.
   //     2l. All navigations triggered between 2g-2k are awaited to be either committed or canceled.
   //     2m. If failed, wait for increasing amount of time before the next retry.
-  setupHitTargetInterceptor(node: Node, action: 'hover' | 'tap' | 'mouse' | 'drag', hitPoint: { x: number, y: number } | undefined, blockAllEvents: boolean): HitTargetInterceptionResult | 'error:notconnected' | string /* hitTargetDescription */ {
+  setupHitTargetInterceptor(node: Node, action: 'hover' | 'tap' | 'mouse' | 'drag', hitPoint: { x: number, y: number } | undefined, blockAllEvents: boolean): HitTargetInterceptionResult | 'error:notconnected' | string /* JSON.stringify(hitTargetDescription) */ {
     const element = this.retarget(node, 'button-link');
     if (!element || !element.isConnected)
       return 'error:notconnected';
@@ -1043,7 +1052,7 @@ export class InjectedScript {
       // intercepting the action.
       const preliminaryResult = this.expectHitTarget(hitPoint, element);
       if (preliminaryResult !== 'done')
-        return preliminaryResult.hitTargetDescription;
+        return JSON.stringify(preliminaryResult);
     }
 
     // When dropping, the "element that is being dragged" often stays under the cursor,
@@ -1058,7 +1067,7 @@ export class InjectedScript {
       'tap': this._tapHitTargetInterceptorEvents,
       'mouse': this._mouseHitTargetInterceptorEvents,
     }[action];
-    let result: 'done' | { hitTargetDescription: string } | undefined;
+    let result: 'done' | HitTargetError | undefined;
 
     const listener = (event: PointerEvent | MouseEvent | TouchEvent) => {
       // Ignore events that we do not expect to intercept.

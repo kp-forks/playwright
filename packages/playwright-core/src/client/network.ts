@@ -176,7 +176,7 @@ export class Request extends ChannelOwner<channels.RequestChannel> implements ap
     if (!this._actualHeadersPromise) {
       this._actualHeadersPromise = this._wrapApiCall(async () => {
         return new RawHeaders((await this._channel.rawRequestHeaders()).headers);
-      }, true);
+      }, { internal: true });
     }
     return await this._actualHeadersPromise;
   }
@@ -346,9 +346,7 @@ export class Route extends ChannelOwner<channels.RouteChannel> implements api.Ro
 
   async fulfill(options: { response?: api.APIResponse, status?: number, headers?: Headers, contentType?: string, body?: string | Buffer, json?: any, path?: string } = {}) {
     await this._handleRoute(async () => {
-      await this._wrapApiCall(async () => {
-        await this._innerFulfill(options);
-      }, true);
+      await this._innerFulfill(options);
     });
   }
 
