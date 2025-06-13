@@ -27,7 +27,7 @@ import * as network from './network';
 import { Page } from './page';
 import { ProgressController } from './progress';
 import * as types from './types';
-import { LongStandingScope, asLocator, assert, constructURLBasedOnBaseURL, makeWaitForNextTask, monotonicTime } from '../utils';
+import { LongStandingScope, asLocator, assert, constructURLBasedOnBaseURL, makeWaitForNextTask, monotonicTime, renderTitleForCall } from '../utils';
 import { isSessionClosedError } from './protocolError';
 import { debugLogger } from './utils/debugLogger';
 import { eventsHelper } from './utils/eventsHelper';
@@ -36,7 +36,6 @@ import { ManualPromise } from '../utils/isomorphic/manualPromise';
 import { compressCallLog } from './callLog';
 
 import type { ConsoleMessage } from './console';
-import type { Dialog } from './dialog';
 import type { ElementStateWithoutStable, FrameExpectParams, InjectedScript } from '@injected/injectedScript';
 import type { CallMetadata } from './instrumentation';
 import type { Progress } from './progress';
@@ -101,8 +100,6 @@ export class FrameManager {
   readonly _consoleMessageTags = new Map<string, ConsoleTagHandler>();
   readonly _signalBarriers = new Set<SignalBarrier>();
   private _webSockets = new Map<string, network.WebSocket>();
-  _openedDialogs: Set<Dialog> = new Set();
-  private _closeAllOpeningDialogs = false;
 
   constructor(page: Page) {
     this._page = page;
@@ -304,16 +301,8 @@ export class FrameManager {
       return;
     }
     this._page.emitOnContext(BrowserContext.Events.Request, request);
-    if (route) {
-      const r = new network.Route(request, route);
-      if (this._page.serverRequestInterceptor?.(r, request))
-        return;
-      if (this._page.clientRequestInterceptor?.(r, request))
-        return;
-      if (this._page.browserContext._requestInterceptor?.(r, request))
-        return;
-      r.continue({ isFallback: true }).catch(() => {});
-    }
+    if (route)
+      new network.Route(request, route).handle([...this._page.requestInterceptors, ...this._page.browserContext.requestInterceptors]);
   }
 
   requestReceivedResponse(response: network.Response) {
@@ -341,29 +330,6 @@ export class FrameManager {
     if (request._isFavicon)
       return;
     this._page.emitOnContext(BrowserContext.Events.RequestFailed, request);
-  }
-
-  dialogDidOpen(dialog: Dialog) {
-    // Any ongoing evaluations will be stalled until the dialog is closed.
-    for (const frame of this._frames.values())
-      frame._invalidateNonStallingEvaluations('JavaScript dialog interrupted evaluation');
-    if (this._closeAllOpeningDialogs)
-      dialog.close().then(() => {});
-    else
-      this._openedDialogs.add(dialog);
-  }
-
-  dialogWillClose(dialog: Dialog) {
-    this._openedDialogs.delete(dialog);
-  }
-
-  async closeOpenDialogs() {
-    await Promise.all([...this._openedDialogs].map(dialog => dialog.close())).catch(() => {});
-    this._openedDialogs.clear();
-  }
-
-  setCloseAllOpeningDialogs(closeDialogs: boolean) {
-    this._closeAllOpeningDialogs = closeDialogs;
   }
 
   removeChildFramesRecursively(frame: Frame) {
@@ -563,7 +529,7 @@ export class Frame extends SdkObject {
   async raceAgainstEvaluationStallingEvents<T>(cb: () => Promise<T>): Promise<T> {
     if (this._pendingDocument)
       throw new Error('Frame is currently attempting a navigation');
-    if (this._page.frameManager._openedDialogs.size)
+    if (this._page.browserContext.dialogManager.hasOpenDialogsForPage(this._page))
       throw new Error('Open JavaScript dialog prevents evaluation');
 
     const promise = new ManualPromise<T>();
@@ -638,7 +604,7 @@ export class Frame extends SdkObject {
     const controller = new ProgressController(serverSideCallMetadata(), this);
     const data = {
       url,
-      gotoPromise: controller.run(progress => this._gotoAction(progress, url, { referer }), 0),
+      gotoPromise: controller.run(progress => this.gotoImpl(progress, url, { referer }), 0),
     };
     this._redirectedNavigations.set(documentId, data);
     data.gotoPromise.finally(() => this._redirectedNavigations.delete(documentId));
@@ -648,11 +614,11 @@ export class Frame extends SdkObject {
     const constructedNavigationURL = constructURLBasedOnBaseURL(this._page.browserContext._options.baseURL, url);
     const controller = new ProgressController(metadata, this);
     return controller.run(progress => {
-      return this.raceNavigationAction(progress, options, async () => this._gotoAction(progress, constructedNavigationURL, options));
+      return this.raceNavigationAction(progress, options, async () => this.gotoImpl(progress, constructedNavigationURL, options));
     }, options.timeout);
   }
 
-  private async _gotoAction(progress: Progress, url: string, options: Omit<types.GotoOptions, 'timeout'>): Promise<network.Response | null> {
+  async gotoImpl(progress: Progress, url: string, options: Omit<types.GotoOptions, 'timeout'>): Promise<network.Response | null> {
     const waitUntil = verifyLifecycle('waitUntil', options.waitUntil === undefined ? 'load' : options.waitUntil);
     progress.log(`navigating to "${url}", waiting until "${waitUntil}"`);
     const headers = this._page.extraHTTPHeaders() || [];
@@ -1196,8 +1162,8 @@ export class Frame extends SdkObject {
     await controller.run(async progress => {
       dom.assertDone(await this._retryWithProgressIfNotConnected(progress, source, options.strict, !options.force /* performActionPreChecks */, async handle => {
         return handle._retryPointerAction(progress, 'move and down', false, async point => {
-          await this._page.mouse.move(point.x, point.y);
-          await this._page.mouse.down();
+          await this._page.mouse._move(progress, point.x, point.y);
+          await this._page.mouse._down(progress);
         }, {
           ...options,
           waitAfter: 'disabled',
@@ -1208,8 +1174,8 @@ export class Frame extends SdkObject {
       // Note: do not perform locator handlers checkpoint to avoid moving the mouse in the middle of a drag operation.
       dom.assertDone(await this._retryWithProgressIfNotConnected(progress, target, options.strict, false /* performActionPreChecks */, async handle => {
         return handle._retryPointerAction(progress, 'move and up', false, async point => {
-          await this._page.mouse.move(point.x, point.y);
-          await this._page.mouse.up();
+          await this._page.mouse._move(progress, point.x, point.y);
+          await this._page.mouse._up(progress);
         }, {
           ...options,
           waitAfter: 'disabled',
@@ -1432,7 +1398,7 @@ export class Frame extends SdkObject {
 
       // Step 1: perform locator handlers checkpoint with a specified timeout.
       await (new ProgressController(metadata, this)).run(async progress => {
-        progress.log(`${metadata.apiName}${timeout ? ` with timeout ${timeout}ms` : ''}`);
+        progress.log(`${renderTitleForCall(metadata)}${timeout ? ` with timeout ${timeout}ms` : ''}`);
         progress.log(`waiting for ${this._asLocator(selector)}`);
         await this._page.performActionPreChecks(progress);
       }, timeout);

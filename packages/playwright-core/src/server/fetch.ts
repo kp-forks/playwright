@@ -24,7 +24,7 @@ import { assert, constructURLBasedOnBaseURL, createProxyAgent, eventsHelper, mon
 import { createGuid } from './utils/crypto';
 import { getUserAgent } from './utils/userAgent';
 import { BrowserContext, verifyClientCertificates } from './browserContext';
-import { CookieStore, domainMatches, parseRawCookie } from './cookieStore';
+import { Cookie, CookieStore, domainMatches, parseRawCookie } from './cookieStore';
 import { MultipartFormData } from './formData';
 import { SdkObject } from './instrumentation';
 import { ProgressController } from './progress';
@@ -208,7 +208,7 @@ export abstract class APIRequestContext extends SdkObject {
     const controller = new ProgressController(metadata, this);
     const fetchResponse = await controller.run(progress => {
       return this._sendRequestWithRetries(progress, requestUrl, options, postData, params.maxRetries);
-    });
+    }, timeout);
     const fetchUid = this._storeResponseBody(fetchResponse.body);
     this.fetchLog.set(fetchUid, controller.metadata.log);
     const failOnStatusCode = params.failOnStatusCode !== undefined ? params.failOnStatusCode : !!defaults.failOnStatusCode;
@@ -255,7 +255,11 @@ export abstract class APIRequestContext extends SdkObject {
   private async _updateRequestCookieHeader(url: URL, headers: HeadersObject) {
     if (getHeader(headers, 'cookie') !== undefined)
       return;
-    const cookies = await this._cookies(url);
+    const contextCookies = await this._cookies(url);
+    // Browser context returns cookies with domain matching both .example.com and
+    // example.com. Those without leading dot are only sent when domain is strictly
+    // matching example.com, but not for sub.example.com.
+    const cookies = contextCookies.filter(c => new Cookie(c).matches(url));
     if (cookies.length) {
       const valueArray = cookies.map(c => `${c.name}=${c.value}`);
       setHeader(headers, 'cookie', valueArray.join('; '));

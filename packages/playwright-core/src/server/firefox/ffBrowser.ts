@@ -19,11 +19,10 @@ import { assert } from '../../utils';
 import { Browser } from '../browser';
 import { BrowserContext, verifyGeolocation } from '../browserContext';
 import { TargetClosedError } from '../errors';
-import { kPlaywrightBinding } from '../javascript';
 import * as network from '../network';
-import { kUtilityInitScript } from '../page';
 import { ConnectionEvents, FFConnection  } from './ffConnection';
 import { FFPage } from './ffPage';
+import { PageBinding } from '../page';
 
 import type { BrowserOptions } from '../browser';
 import type { SdkObject } from '../instrumentation';
@@ -298,18 +297,35 @@ export class FFBrowserContext extends BrowserContext {
   async doGetCookies(urls: string[]): Promise<channels.NetworkCookie[]> {
     const { cookies } = await this._browser.session.send('Browser.getCookies', { browserContextId: this._browserContextId });
     return network.filterCookies(cookies.map(c => {
-      const copy: any = { ... c };
-      delete copy.size;
-      delete copy.session;
-      return copy as channels.NetworkCookie;
+      const { name, value, domain, path, expires, httpOnly, secure, sameSite } = c;
+      return {
+        name,
+        value,
+        domain,
+        path,
+        expires,
+        httpOnly,
+        secure,
+        sameSite,
+      };
     }), urls);
   }
 
   async addCookies(cookies: channels.SetNetworkCookie[]) {
-    const cc = network.rewriteCookies(cookies).map(c => ({
-      ...c,
-      expires: c.expires === -1 ? undefined : c.expires,
-    }));
+    const cc = network.rewriteCookies(cookies).map(c => {
+      const { name, value, url, domain, path, expires, httpOnly, secure, sameSite } = c;
+      return {
+        name,
+        value,
+        url,
+        domain,
+        path,
+        expires: expires === -1 ? undefined : expires,
+        httpOnly,
+        secure,
+        sameSite
+      };
+    });
     await this._browser.session.send('Browser.setCookies', { browserContextId: this._browserContextId, cookies: cc });
   }
 
@@ -374,7 +390,7 @@ export class FFBrowserContext extends BrowserContext {
     await this._updateInitScripts();
   }
 
-  async doRemoveNonInternalInitScripts() {
+  async doRemoveInitScripts(initScripts: InitScript[]) {
     await this._updateInitScripts();
   }
 
@@ -383,18 +399,18 @@ export class FFBrowserContext extends BrowserContext {
     if (this.bindingsInitScript)
       bindingScripts.unshift(this.bindingsInitScript.source);
     const initScripts = this.initScripts.map(script => script.source);
-    await this._browser.session.send('Browser.setInitScripts', { browserContextId: this._browserContextId, scripts: [kUtilityInitScript.source, ...bindingScripts, ...initScripts].map(script => ({ script })) });
+    await this._browser.session.send('Browser.setInitScripts', { browserContextId: this._browserContextId, scripts: [...bindingScripts, ...initScripts].map(script => ({ script })) });
   }
 
   async doUpdateRequestInterception(): Promise<void> {
     await Promise.all([
-      this._browser.session.send('Browser.setRequestInterception', { browserContextId: this._browserContextId, enabled: !!this._requestInterceptor }),
-      this._browser.session.send('Browser.setCacheDisabled', { browserContextId: this._browserContextId, cacheDisabled: !!this._requestInterceptor }),
+      this._browser.session.send('Browser.setRequestInterception', { browserContextId: this._browserContextId, enabled: this.requestInterceptors.length > 0 }),
+      this._browser.session.send('Browser.setCacheDisabled', { browserContextId: this._browserContextId, cacheDisabled: this.requestInterceptors.length > 0 }),
     ]);
   }
 
   override async doExposePlaywrightBinding() {
-    this._browser.session.send('Browser.addBinding', { browserContextId: this._browserContextId, name: kPlaywrightBinding, script: '' });
+    this._browser.session.send('Browser.addBinding', { browserContextId: this._browserContextId, name: PageBinding.kBindingName, script: '' });
   }
 
   onClosePersistent() {}
