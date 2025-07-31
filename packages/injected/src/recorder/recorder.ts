@@ -422,9 +422,7 @@ class RecordActionTool implements RecorderTool {
 
     if (target.nodeName === 'SELECT') {
       const selectElement = target as HTMLSelectElement;
-      if (this._actionInProgress(event))
-        return;
-      this._performAction({
+      this._recordAction({
         name: 'select',
         selector: this._activeModel!.selector,
         options: [...selectElement.selectedOptions].map(option => option.value),
@@ -640,6 +638,15 @@ class JsonRecordActionTool implements RecorderTool {
 
   constructor(recorder: Recorder) {
     this._recorder = recorder;
+  }
+
+  install() {
+    // No highlight for the lightweight recorder.
+    this._recorder.highlight.uninstall();
+  }
+
+  uninstall() {
+    this._recorder.highlight.install();
   }
 
   onClick(event: MouseEvent) {
